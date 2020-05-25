@@ -536,8 +536,10 @@ bool initialize()
     Serial.println(F("NO"));
     if (hasSIM) return false;
   }
-  if (net.getLocation()) {
-    Serial.println(F("CELL GPS ON"));
+
+  if (!state.check(STATE_GPS_READY)) {
+    net.startGPS();
+    Serial.println(F("GPS:CELL"));
   }
 #endif
 
@@ -569,6 +571,7 @@ void shutDownNet()
   //obd.checkConn();
   Serial.print(F("CELL:"));
   net.close();
+  net.stopGPS();
   net.end();
   Serial.println(F("OFF"));
   state.clear(STATE_NET_READY | STATE_SERVER_CONNECTED);
@@ -754,9 +757,8 @@ void recvTasks(int timeout)
     char *data = net.receive(&len, timeout);
     if (data) {
       data[len] = 0;
-      Serial.print(F("RECV:{"));
-      Serial.print(data);
-      Serial.println('}');
+      Serial.print(F("[IN]"));
+      Serial.println(data);
       if (!verifyChecksum(data)) {
         return;
       }
@@ -778,10 +780,13 @@ void setup()
   // Disable digital input buffers on all analog input pins
   DIDR0 = DIDR0 | B00111111;
 
+  // change to 9600bps when using BLE
   Serial.begin(115200);
+
+  // begin co-processor communication
   obd.begin();
 
-  // initializing components
+  // initialize components
   initialize();
 }
 
@@ -823,9 +828,8 @@ void loop()
   // collect data
   process();
 
-  Serial.print(F("DATA:{"));
-  Serial.print(cache.buffer()); 
-  Serial.println('}');
+  Serial.print(F("[OUT]"));
+  Serial.println(cache.buffer()); 
 
   // transmit data
   if (state.check(STATE_SERVER_CONNECTED)) {

@@ -59,12 +59,12 @@ PID_POLLING_INFO obdData[]= {
 CBufferManager bufman;
 Task subtask;
 
-#if MEMS_MODE
+#if ENABLE_MEMS
 float accBias[3] = {0}; // calibrated reference accelerometer data
 float accSum[3] = {0};
 uint8_t accCount = 0;
 #endif
-int16_t deviceTemp = 0;
+float deviceTemp = 0;
 
 // live data
 int16_t rssi = 0;
@@ -81,12 +81,13 @@ char isoTime[26] = {0};
 uint32_t lastMotionTime = 0;
 uint32_t timeoutsOBD = 0;
 uint32_t timeoutsNet = 0;
+uint32_t lastStatsTime = 0;
 
 uint32_t syncInterval = SERVER_SYNC_INTERVAL * 1000;
 
 #if STORAGE != STORAGE_NONE
 int fileid = 0;
-static uint16_t lastSizeKB = 0;
+uint16_t lastSizeKB = 0;
 #endif
 
 uint32_t lastCmdToken = 0;
@@ -117,21 +118,16 @@ protected:
   void idleTasks()
   {
     // do some quick tasks while waiting for OBD response
-#if MEMS_MODE
+#if ENABLE_MEMS
     processMEMS(0);
 #endif
+    delay(5);
   }
 };
 
 OBD obd;
 
-#if MEMS_MODE == MEMS_ACC
-MPU9250_ACC mems;
-#elif MEMS_MODE == MEMS_9DOF
-MPU9250_9DOF mems;
-#elif MEMS_MODE == MEMS_DMP
-MPU9250_DMP mems;
-#endif
+MEMS_I2C* mems = 0;
 
 #if STORAGE == STORAGE_SPIFFS
 SPIFFSLogger logger;
@@ -192,7 +188,7 @@ int handlerLiveData(UrlHandlerParam* param)
     }
     n--;
     n += snprintf(buf + n, bufsize - n, "]}");
-#if MEMS_MODE
+#if ENABLE_MEMS
     if (accCount) {
       n += snprintf(buf + n, bufsize - n, ",\"mems\":{\"acc\":[%d,%d,%d],\"stationary\":%u}",
           (int)((accSum[0] / accCount - accBias[0]) * 100), (int)((accSum[1] / accCount - accBias[1]) * 100), (int)((accSum[2] / accCount - accBias[2]) * 100),
@@ -339,22 +335,23 @@ bool waitMotionGPS(int timeout)
   return false;
 }
 
-#if MEMS_MODE
+#if ENABLE_MEMS
 void processMEMS(CBuffer* buffer)
 {
   if (!state.check(STATE_MEMS_READY)) return;
 
   // load and store accelerometer data
-  int16_t temp = 0;
+  float temp = 0;
   float acc[3];
-#if ENABLE_ORIENTATION
-  ORIENTATION ori;
   float gyr[3];
   float mag[3];
-  mems.read(acc, gyr, mag, &temp, &ori);
+#if ENABLE_ORIENTATION
+  ORIENTATION ori;
+  if (!mems->read(acc, gyr, mag, &temp, &ori)) return;
 #else
-  if (!mems.read(acc, 0, 0, &temp)) return;
+  if (!mems->read(acc, gyr, mag, &temp)) return;
 #endif
+
   accSum[0] += acc[0];
   accSum[1] += acc[1];
   accSum[2] += acc[2];
@@ -373,18 +370,19 @@ void processMEMS(CBuffer* buffer)
       value[2] = ori.roll;
       buffer->add(PID_ORIENTATION, value);
 #endif
-      temp /= 10;
       if (temp != deviceTemp) {
-        buffer->add(PID_DEVICE_TEMP, (int)(deviceTemp = temp));
+        deviceTemp = temp;
+        buffer->add(PID_DEVICE_TEMP, (int)(temp * 10));
       }
-      // calculate instant motion
+      // calculate motion
       float motion = 0;
       for (byte i = 0; i < 3; i++) {
-        float m = (acc[i] - accBias[i]);
-        motion += m * m;
+        motion += value[i] * value[i];
       }
       if (motion >= MOTION_THRESHOLD * MOTION_THRESHOLD) {
         lastMotionTime = millis();
+        Serial.print("Motion:");
+        Serial.println(motion);
       }
     }
     accSum[0] = 0;
@@ -403,8 +401,8 @@ void calibrateMEMS()
     int n;
     unsigned long t = millis();
     for (n = 0; millis() - t < 1000; n++) {
-      float acc[3] = {0};
-      mems.read(acc);
+      float acc[3];
+      if (!mems->read(acc)) continue;
       accBias[0] += acc[0];
       accBias[1] += acc[1];
       accBias[2] += acc[2];
@@ -443,7 +441,9 @@ void printTime()
 *******************************************************************************/
 void initialize()
 {
-#if MEMS_MODE
+  bufman.purge();
+
+#if ENABLE_MEMS
   if (state.check(STATE_MEMS_READY)) {
     calibrateMEMS();
   }
@@ -503,8 +503,6 @@ void initialize()
     fileid = logger.begin();
   }
 #endif
-
-
 
   // re-try OBD if connection not established
 #if ENABLE_OBD
@@ -676,14 +674,14 @@ void showStats()
 bool waitMotion(long timeout)
 {
   unsigned long t = millis();
-#if MEMS_MODE
+#if ENABLE_MEMS
   if (state.check(STATE_MEMS_READY)) {
     do {
       serverProcess(100);
       // calculate relative movement
       float motion = 0;
       float acc[3];
-      mems.read(acc);
+      if (!mems->read(acc)) continue;
       if (accCount == 10) {
         accCount = 0;
         accSum[0] = 0;
@@ -744,7 +742,7 @@ void process()
 
 #if ENABLE_OBD
   if (sys.version > 12) {
-    batteryVoltage = (float)(analogRead(A0) * 11 * 370) / 4095;
+    batteryVoltage = (float)(analogRead(A0) * 12 * 370) / 4095;
   } else {
     batteryVoltage = obd.getVoltage() * 100;
   }
@@ -757,7 +755,7 @@ void process()
   processExtInputs(buffer);
 #endif
 
-#if MEMS_MODE
+#if ENABLE_MEMS
   processMEMS(buffer);
 #endif
 
@@ -770,6 +768,12 @@ void process()
 
   buffer->timestamp = millis();
   buffer->state = BUFFER_STATE_FILLED;
+
+  // display file buffer stats
+  if (startTime - lastStatsTime >= 3000) {
+    bufman.printStats();
+    lastStatsTime = startTime;
+  }
 
 #if STORAGE != STORAGE_NONE
   if (state.check(STATE_STORAGE_READY)) {
@@ -784,7 +788,6 @@ void process()
     }
   }
 #endif
-  bufman.printStats();
 
 #if DATASET_INTERVAL
   long t = (long)DATASET_INTERVAL - (millis() - startTime);
@@ -999,7 +1002,7 @@ void telemetry(void* inst)
 
       store.purge();
 
-#if ENABLE_OBD || ENABLE_GPS || MEMS_MODE
+#if ENABLE_OBD || ENABLE_GPS || ENABLE_MEMS
       // motion adaptive data transmission interval control
       unsigned int motionless = (millis() - lastMotionTime) / 1000;
       int sendingInterval = -1;
@@ -1065,7 +1068,7 @@ void standby()
 #endif
 #if ENABLE_GPS
   if (state.check(STATE_GPS_READY)) {
-    Serial.println("GPS OFF");
+    Serial.println("GNSS OFF");
     sys.gpsEnd();
   }
   gd = 0;
@@ -1080,7 +1083,7 @@ void standby()
   oled.clear();
 #endif
   Serial.println("STANDBY");
-#if MEMS_MODE
+#if ENABLE_MEMS
   calibrateMEMS();
   waitMotion(-1);
 #elif ENABLE_OBD
@@ -1093,8 +1096,8 @@ void standby()
   Serial.println("Wakeup");
 
 #if RESET_AFTER_WAKEUP
-#if MEMS_MODE
-  mems.end();  
+#if ENABLE_MEMS
+  mems->end();  
 #endif
   ESP.restart();
 #endif  
@@ -1270,19 +1273,31 @@ void setup()
     obd.begin(sys.link);
 #endif
 
-    // turn on buzzer at 2000Hz frequency 
-    sys.buzzer(2000);
+  // turn on buzzer at 2000Hz frequency 
+  sys.buzzer(2000);
+  delay(200);
+  // turn off buzzer
+  sys.buzzer(0);
 
-#if MEMS_MODE
+#if ENABLE_MEMS
   if (!state.check(STATE_MEMS_READY)) {
-    byte ret = mems.begin(ENABLE_ORIENTATION);
+    Serial.print("MEMS:");
+    mems = new MPU9250;
+    byte ret = mems->begin(ENABLE_ORIENTATION);
     if (ret) {
       state.set(STATE_MEMS_READY);
-      Serial.print("MEMS:OK");
-      if (ret == 2) Serial.print(" 9-DOF");
-      Serial.println();
+      Serial.println("MPU-9250");
     } else {
-      Serial.println("MEMS:NO");
+      mems->end();
+      delete mems;
+      mems = new ICM_20948_I2C;
+      ret = mems->begin(ENABLE_ORIENTATION);
+      if (ret) {
+        state.set(STATE_MEMS_READY);
+        Serial.println("ICM-20948");
+      } else {
+        Serial.println("NO");
+      }
     }
   }
 #endif
@@ -1299,9 +1314,6 @@ void setup()
       Serial.println("HTTPD:NO");
     }
 #endif
-
-    // turn off buzzer
-    sys.buzzer(0);
 
     state.set(STATE_WORKING);
     // initialize network and maintain connection

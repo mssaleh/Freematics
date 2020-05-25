@@ -420,13 +420,10 @@ bool UDPClientSIM5360::begin(CFreematics* device, bool nocheck)
   }
   unsigned long t = millis();
   for (;;) {
-    delay(3000);
-    for (byte m = 0; m < 3; m++) {
-      sendCommand("AT\r");
-      if (sendCommand("ATE0\r") && sendCommand("ATI\r")) {
-        m_stage = 2;
-        return true;
-      }
+    if (!sendCommand("AT\r")) sendCommand(0, 5000, "START");
+    if (sendCommand("ATE0\r") && sendCommand("ATI\r")) {
+      m_stage = 2;
+      return true;
     }
     if (millis() - t >= 30000) break;
     device->xbTogglePower();
@@ -436,13 +433,8 @@ bool UDPClientSIM5360::begin(CFreematics* device, bool nocheck)
 
 void UDPClientSIM5360::end()
 {
-  sendCommand("AT+CGPS=0\r");
   sendCommand("AT+CPOF\r");
   m_stage = 1;
-  if (m_gps) {
-    delete m_gps;
-    m_gps = 0;
-  }
 }
 
 bool UDPClientSIM5360::setup(const char* apn, unsigned int timeout, bool gps, const char* pin)
@@ -499,15 +491,29 @@ bool UDPClientSIM5360::setup(const char* apn, unsigned int timeout, bool gps, co
     sendCommand("AT+NETOPEN\r");
   } while(0);
   if (!success) Serial.println(m_buffer);
+  return success;
+}
+
+bool UDPClientSIM5360::startGPS()
+{
+  // set GPS antenna voltage
   sendCommand("AT+CVAUXV=61\r");
   sendCommand("AT+CVAUXS=1\r");
   if (sendCommand("AT+CGPS=1\r") || sendCommand("AT+CGPS?\r", 100, "+CGPS: 1")) {
-    if (!m_gps) {
-      m_gps = new GPS_DATA;
-      memset(m_gps, 0, sizeof(GPS_DATA));
-    }
+    if (!m_gps) m_gps = new GPS_DATA;
+    memset(m_gps, 0, sizeof(GPS_DATA));
+    return true;
   }
-  return success;
+  return false;
+}
+
+void UDPClientSIM5360::stopGPS()
+{
+  sendCommand("AT+CGPS=0\r");
+  if (m_gps) {
+    delete m_gps;
+    m_gps = 0;
+  }
 }
 
 String UDPClientSIM5360::getIP()
